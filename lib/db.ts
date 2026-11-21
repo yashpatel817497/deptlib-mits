@@ -1,20 +1,8 @@
-import { getCloudflareContext } from "@opennextjs/cloudflare";
+import { createClient, type Client, type InValue } from "@libsql/client";
 import { nowISO } from "./dates";
 
-interface D1PreparedStatement {
-  bind(...values: unknown[]): D1PreparedStatement;
-  first<T = Record<string, unknown>>(): Promise<T | null>;
-  all<T = Record<string, unknown>>(): Promise<{ results?: T[] }>;
-  run(): Promise<{ meta?: { changes?: number; last_row_id?: number } }>;
-}
-
-interface D1Database {
-  prepare(query: string): D1PreparedStatement;
-  exec(query: string): Promise<unknown>;
-}
-
 const globalForDb = globalThis as unknown as {
-  __dlmsDb?: Promise<D1Database>;
+  __dlmsDb?: Promise<Client>;
 };
 
 const SCHEMA = `
@@ -171,10 +159,6 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_issue_requests_status ON issue_requests(status, created_at);
 `;
 
-/**
- * Additive column migrations so databases created before a field existed keep
- * every row they already hold. New columns only — nothing is dropped or rebuilt.
- */
 const COLUMN_MIGRATIONS: Array<{ table: string; column: string; ddl: string }> = [
   { table: "books", column: "isbn", ddl: "ALTER TABLE books ADD COLUMN isbn TEXT NOT NULL DEFAULT ''" },
   { table: "books", column: "category", ddl: "ALTER TABLE books ADD COLUMN category TEXT NOT NULL DEFAULT ''" },
@@ -186,16 +170,15 @@ const COLUMN_MIGRATIONS: Array<{ table: string; column: string; ddl: string }> =
   { table: "students", column: "phone", ddl: "ALTER TABLE students ADD COLUMN phone TEXT NOT NULL DEFAULT ''" },
 ];
 
-async function migrate(db: D1Database): Promise<void> {
+async function migrate(db: Client): Promise<void> {
   for (const table of ["books", "students"]) {
-    const info = await db.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
-    const present = new Set((info.results ?? []).map((row) => String(row.name)));
+    const info = await db.execute(`PRAGMA table_info(${table})`);
+    const present = new Set(info.rows.map((row) => String(row.name)));
     for (const migration of COLUMN_MIGRATIONS.filter((entry) => entry.table === table)) {
       if (present.has(migration.column)) continue;
       try {
-        await db.prepare(migration.ddl).run();
+        await db.execute(migration.ddl);
       } catch (error) {
-        // Two isolates can race the same additive migration; a duplicate column is safe.
         const message = error instanceof Error ? error.message : String(error);
         if (!/duplicate column name/i.test(message)) throw error;
       }
@@ -203,7 +186,7 @@ async function migrate(db: D1Database): Promise<void> {
   }
 }
 
-function database(): Promise<D1Database> {
+function database(): Promise<Client> {
   if (!globalForDb.__dlmsDb) {
     globalForDb.__dlmsDb = connect().catch((error) => {
       globalForDb.__dlmsDb = undefined;
@@ -213,18 +196,26 @@ function database(): Promise<D1Database> {
   return globalForDb.__dlmsDb;
 }
 
-async function connect(): Promise<D1Database> {
-  const { env } = await getCloudflareContext({ async: true });
-  const db = (env as unknown as { DB?: D1Database }).DB;
-  if (!db) {
-    throw new Error("The D1 database binding `DB` is not configured.");
+async function connect(): Promise<Client> {
+  const url = process.env.TURSO_DATABASE_URL;
+  const authToken = process.env.TURSO_AUTH_TOKEN;
+
+  if (!url) {
+    throw new Error("TURSO_DATABASE_URL is not configured in Environment Variables.");
   }
+
+  const db = createClient({ url, authToken });
+
   for (const statement of SCHEMA.split(";").map((part) => part.trim()).filter(Boolean)) {
-    await db.prepare(statement).run();
+    await db.execute(statement);
   }
   await migrate(db);
   await seed(db);
   return db;
+}
+
+function toArgs(params: unknown[]): InValue[] {
+  return params.map((p) => (p === undefined ? null : (p as InValue)));
 }
 
 export async function all<T = Record<string, unknown>>(
@@ -232,17 +223,16 @@ export async function all<T = Record<string, unknown>>(
   ...params: unknown[]
 ): Promise<T[]> {
   const db = await database();
-  const result = await db.prepare(sql).bind(...params).all<T>();
-  return result.results ?? [];
+  const result = await db.execute({ sql, args: toArgs(params) });
+  return result.rows as unknown as T[];
 }
 
 export async function one<T = Record<string, unknown>>(
   sql: string,
   ...params: unknown[]
 ): Promise<T | undefined> {
-  const db = await database();
-  const result = await db.prepare(sql).bind(...params).first<T>();
-  return result ?? undefined;
+  const rows = await all<T>(sql, ...params);
+  return rows[0];
 }
 
 export async function run(
@@ -250,10 +240,10 @@ export async function run(
   ...params: unknown[]
 ): Promise<{ changes: number; lastInsertRowid: number }> {
   const db = await database();
-  const result = await db.prepare(sql).bind(...params).run();
+  const result = await db.execute({ sql, args: toArgs(params) });
   return {
-    changes: Number(result.meta?.changes ?? 0),
-    lastInsertRowid: Number(result.meta?.last_row_id ?? 0),
+    changes: Number(result.rowsAffected ?? 0),
+    lastInsertRowid: Number(result.lastInsertRowid ?? 0),
   };
 }
 
@@ -266,31 +256,33 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   max_unpaid_fine: "100",
 };
 
-async function seed(db: D1Database): Promise<void> {
+async function seed(db: Client): Promise<void> {
   for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-    await db
-      .prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)")
-      .bind(key, value)
-      .run();
+    await db.execute({
+      sql: "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+      args: [key, value],
+    });
   }
 
-  const existing = await db
-    .prepare("SELECT COUNT(*) AS count FROM departments")
-    .first<{ count: number }>();
-  if (Number(existing?.count ?? 0) > 0) return;
+  const existing = await db.execute("SELECT COUNT(*) AS count FROM departments");
+  const count = Number(existing.rows[0]?.count ?? 0);
+  if (count > 0) return;
 
   const now = nowISO();
   const deptIds: Record<string, number> = {};
-  const insertDepartment = db.prepare(
-    "INSERT OR IGNORE INTO departments (dept_name, created_at) VALUES (?, ?)"
-  );
+
   for (const name of ["AIML", "Computer Science", "Electronics", "Mechanical"]) {
-    await insertDepartment.bind(name, now).run();
-    const row = await db
-      .prepare("SELECT dept_id FROM departments WHERE dept_name = ?")
-      .bind(name)
-      .first<{ dept_id: number }>();
-    if (row) deptIds[name] = Number(row.dept_id);
+    await db.execute({
+      sql: "INSERT OR IGNORE INTO departments (dept_name, created_at) VALUES (?, ?)",
+      args: [name, now],
+    });
+    const row = await db.execute({
+      sql: "SELECT dept_id FROM departments WHERE dept_name = ?",
+      args: [name],
+    });
+    if (row.rows[0]) {
+      deptIds[name] = Number(row.rows[0].dept_id);
+    }
   }
 
   const books: Array<[string, string, string]> = [
@@ -307,27 +299,26 @@ async function seed(db: D1Database): Promise<void> {
     ["Fundamentals of Engineering Thermodynamics", "Michael J. Moran", "Mechanical"],
     ["Shigley's Mechanical Engineering Design", "Richard G. Budynas", "Mechanical"],
   ];
-  const insertBook = db.prepare(
-    `INSERT INTO books (title, author, dept_id, availability_status, replacement_cost, created_at)
-     SELECT ?, ?, ?, 'Available', 500, ?
-     WHERE NOT EXISTS (
-       SELECT 1 FROM books WHERE title = ? COLLATE NOCASE AND dept_id = ?
-     )`
-  );
+
   for (const [title, author, dept] of books) {
-    await insertBook.bind(title, author, deptIds[dept], now, title, deptIds[dept]).run();
+    await db.execute({
+      sql: `INSERT INTO books (title, author, dept_id, availability_status, replacement_cost, created_at)
+            SELECT ?, ?, ?, 'Available', 500, ?
+            WHERE NOT EXISTS (
+              SELECT 1 FROM books WHERE title = ? COLLATE NOCASE AND dept_id = ?
+            )`,
+      args: [title, author, deptIds[dept], now, title, deptIds[dept]],
+    });
   }
 
-  await db
-    .prepare(
-      `INSERT INTO announcements (message, author, created_at)
-       SELECT ?, ?, ?
-       WHERE NOT EXISTS (SELECT 1 FROM announcements WHERE author = 'Library')`
-    )
-    .bind(
+  await db.execute({
+    sql: `INSERT INTO announcements (message, author, created_at)
+          SELECT ?, ?, ?
+          WHERE NOT EXISTS (SELECT 1 FROM announcements WHERE author = 'Library')`,
+    args: [
       "Welcome to the department library portal. Borrow up to 3 books for 14 days. Fines are ₹5 per day after a 2-day grace period.",
       "Library",
-      now
-    )
-    .run();
+      now,
+    ],
+  });
 }
