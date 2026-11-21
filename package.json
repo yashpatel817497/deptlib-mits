@@ -9,17 +9,16 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@libsql/client": "^0.14.0",
     "lucide-react": "^0.468.0",
     "next": "^16.4.6",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
   "devDependencies": {
-    "@opennextjs/cloudflare": "1.20.12",
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "typescript": "^5.7.2",
-    "wrangler": "4.148.0"
+    "typescript": "^5.7.2"
   }
 }
